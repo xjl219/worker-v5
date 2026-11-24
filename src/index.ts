@@ -296,14 +296,14 @@ interface Env {
   UUID: string;
   AP?: string;
   AH?: string;
-  PROXY_ENABLED?: string;
+  PE?: string;
   HE?: string;
   OM?: string;
   RE?: string;
   H?: string;
   P?: string;
-  SOCKS5_USERNAME?: string;
-  SOCKS5_PASSWORD?: string;
+  SU?: string;
+  SP?: string;
 }
 
 const DEFAULT_AP = [80, 443, 8080, 8443, 2053, 2083, 2087, 2096];
@@ -410,10 +410,10 @@ async function connectViaSocks5(
   if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
     throw new Error("P is invalid");
   }
-  const username = env.SOCKS5_USERNAME || "";
-  const password = env.SOCKS5_PASSWORD || "";
+  const username = env.SU || "";
+  const password = env.SP || "";
   if ((username.length > 0) !== (password.length > 0)) {
-    throw new Error("Both SOCKS5_USERNAME and SOCKS5_PASSWORD must be set together");
+    throw new Error("Both SU and SP must be set together");
   }
   const usernameBytes = new TextEncoder().encode(username);
   const passwordBytes = new TextEncoder().encode(password);
@@ -499,7 +499,7 @@ function isOutboundConfigured(env: Env): boolean {
       if (!env.H?.trim()) return false;
       const port = Number(env.P || "1080");
       if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
-      return (Boolean(env.SOCKS5_USERNAME) === Boolean(env.SOCKS5_PASSWORD));
+      return (Boolean(env.SU) === Boolean(env.SP));
     }
     return false;
   } catch {
@@ -558,7 +558,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
     return response("Not found", 404);
   }
-  if (env.PROXY_ENABLED !== "true") return response("Not found", 404);
+  if (env.PE !== "true") return response("Not found", 404);
   if (!env.UUID || !isOutboundConfigured(env) || !hasValidAllowedHosts(env)) {
     return response("Not found", 404);
   }
