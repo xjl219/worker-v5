@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getPublicSurfaceResponse } from "../src/public-surface";
+import { getPublicSurfaceResponse } from "../src/index";
 
 function probe(path: string, options: RequestInit = {}, healthEnabled?: string): Response | null {
   return getPublicSurfaceResponse(new Request("https://worker.example" + path, options), healthEnabled);
