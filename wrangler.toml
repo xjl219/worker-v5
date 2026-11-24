@@ -1,0 +1,24 @@
+name = "worker-v5"
+main = "src/index.ts"
+compatibility_date = "2026-11-23"
+
+[placement]
+region = "gcp:us-central1"
+
+[observability]
+enabled = true
+
+# Non-secret runtime configuration.
+# PROXY_ENABLED is intentionally managed in the Cloudflare dashboard.
+[vars]
+HEALTH_ENABLED = "false"
+OUTBOUND_MODE = "direct"
+ALLOWED_PORTS = "80,443,8080,8443,2053,2083,2087,2096"
+RELAY_ENDPOINTS = ""
+SOCKS5_HOST = ""
+SOCKS5_PORT = "1080"
+
+# Secrets must be configured separately; never commit credentials here:
+#   npx wrangler secret put UUID
+#   npx wrangler secret put SOCKS5_USERNAME
+#   npx wrangler secret put SOCKS5_PASSWORD
