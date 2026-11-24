@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseV1Request, encodeS5Address } from "../src/v1-s5";
-import { isAllowedDestinationHost, normalizeDestinationHostname, parseAllowedHosts } from "../src/security";
+import { parseV1Request, encodeS5Address } from "../src/index";
+import { isAllowedDestinationHost, normalizeDestinationHostname, parseAllowedHosts } from "../src/index";
 
 const UUID = "00000000-0000-4000-8000-000000000001";
 
