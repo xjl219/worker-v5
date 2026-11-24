@@ -75,7 +75,7 @@ export class CircuitBreakerRegistry {
 // Destination security and hostname allowlist
 const DOMAIN_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
-export export function normalizeDestinationHostname(input: string): string {
+export function normalizeDestinationHostname(input: string): string {
   const host = input.trim().toLowerCase().replace(/\.$/, "");
   if (!host || host.length > 253 || host.includes("*") || host.includes("/") ||
       host.includes("@") || host.includes(":") || host.includes("%") ||
@@ -92,7 +92,7 @@ export export function normalizeDestinationHostname(input: string): string {
   return host;
 }
 
-export export function parseAllowedHosts(raw: string | undefined): Set<string> {
+export function parseAllowedHosts(raw: string | undefined): Set<string> {
   if (!raw?.trim()) return new Set();
   const entries = raw.split(",");
   const hosts = new Set<string>();
@@ -108,7 +108,7 @@ export export function parseAllowedHosts(raw: string | undefined): Set<string> {
  * Only the exact normalized hostname is authorized. Parent domains never
  * implicitly authorize subdomains.
  */
-export export function isAllowedDestinationHost(hostname: string, allowed: Set<string>): boolean {
+export function isAllowedDestinationHost(hostname: string, allowed: Set<string>): boolean {
   try {
     return allowed.has(normalizeDestinationHostname(hostname));
   } catch {
