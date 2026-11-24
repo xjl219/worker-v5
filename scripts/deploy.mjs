@@ -103,7 +103,7 @@ async function main() {
   });
   if (decision.action === "reuse") {
     process.stdout.write("Reusing the existing Cloudflare UUID secret.\n");
-    // Keep variables managed in Cloudflare Dashboard (including PROXY_ENABLED)
+    // Keep variables managed in Cloudflare Dashboard (including PE)
     // instead of replacing them with the checked-in Wrangler configuration.
     runWrangler(["deploy", "--keep-vars"]);
     return;
