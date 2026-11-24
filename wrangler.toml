@@ -11,12 +11,12 @@ enabled = true
 # Non-secret runtime configuration.
 # PROXY_ENABLED is intentionally managed in the Cloudflare dashboard.
 [vars]
-HEALTH_ENABLED = "false"
-OUTBOUND_MODE = "direct"
-ALLOWED_PORTS = "80,443,8080,8443,2053,2083,2087,2096"
-RELAY_ENDPOINTS = ""
-SOCKS5_HOST = ""
-SOCKS5_PORT = "1080"
+HE = "false"
+OM = "direct"
+AP = "80,443,8080,8443,2053,2083,2087,2096"
+RE = ""
+H = ""
+P = "1080"
 
 # Secrets must be configured separately; never commit credentials here:
 #   npx wrangler secret put UUID
