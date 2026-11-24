@@ -23,14 +23,14 @@ VLESS client -> Cloudflare Worker -> selected outbound adapter
 |---|---|---:|---|
 | `UUID` | Secret | Yes | VLESS client UUID; the secure deploy command creates it on first deployment and reuses the Cloudflare secret on later deployments |
 | `OM` | Variable | No | `direct` (default), `relay`, or `socks5` |
-| `PROXY_ENABLED` | Dashboard variable | Yes | Set in Cloudflare Worker Settings → Variables; keep `false` until acceptance is complete; only literal `true` enables proxying |
+| `PE` | Dashboard variable | Yes | Set in Cloudflare Worker Settings → Variables; keep `false` until acceptance is complete; only literal `true` enables proxying |
 | `AH` | Dashboard variable | Yes | Comma-separated exact destination hostnames. Every destination must match one entry exactly; subdomains are not inherited. No wildcard, URL, path, or port entries. |
 | `AP` | Variable | No | Comma-separated destination ports |
 | `RE` | Variable | Relay only | Comma-separated `host:port` relay endpoints |
 | `H` | Variable | SOCKS5 only | Authorized SOCKS5 server hostname/IP |
 | `P` | Variable | No | SOCKS5 port; defaults to 1080 |
-| `SOCKS5_USERNAME` | Secret | No | Set together with password |
-| `SOCKS5_PASSWORD` | Secret | No | Set together with username |
+| `SU` | Secret | No | Set together with password |
+| `SP` | Secret | No | Set together with username |
 
 ### Automatic UUID provisioning
 
@@ -64,15 +64,15 @@ PROXY_UUID="$(node -e 'console.log(require("node:crypto").randomUUID())')" npm r
 
 The value is stored as the Cloudflare `UUID` secret. For generated credentials, retrieve the client UUID from `.wrangler/proxy-uuid.txt` and keep it in your password manager. Cloudflare secret listings expose names, not secret values. If you do not provide an override on later deployments, the existing remote secret is reused.
 
-Only when using an authenticated SOCKS5 upstream, set `SOCKS5_USERNAME` and `SOCKS5_PASSWORD` as Cloudflare secrets separately. Never put any credentials in `wrangler.toml`, source control, URLs, or logs.
+Only when using an authenticated SOCKS5 upstream, set `SU` and `SP` as Cloudflare secrets separately. Never put any credentials in `wrangler.toml`, source control, URLs, or logs.
 
-`PROXY_ENABLED` is intentionally not declared in `wrangler.toml`: set it in Cloudflare Dashboard → Workers & Pages → this Worker → Settings → Variables and Secrets. Set it to `false` for initial deployment and only change it to `true` after controlled acceptance. The deploy script uses Wrangler `--keep-vars` so dashboard-managed variables are retained on subsequent deployments. Do not add this switch back to the repository configuration.
+`PE` is intentionally not declared in `wrangler.toml`: set it in Cloudflare Dashboard → Workers & Pages → this Worker → Settings → Variables and Secrets. Set it to `false` for initial deployment and only change it to `true` after controlled acceptance. The deploy script uses Wrangler `--keep-vars` so dashboard-managed variables are retained on subsequent deployments. Do not add this switch back to the repository configuration.
 
 
 Example safe initial configuration:
 
 - `OM=direct`
-- In Cloudflare Dashboard, set `PROXY_ENABLED=false` until configuration and controlled tests are complete
+- In Cloudflare Dashboard, set `PE=false` until configuration and controlled tests are complete
 - Set `AH` to the exact destination hostnames required by the client; the proxy remains disabled if the list is missing or invalid
 - Do not create or enable a Cloudflare Access application for the initial workers.dev deployment
 - Do not configure WAF rules for this initial workers.dev deployment; workers.dev is Cloudflare-managed and does not provide owner-managed zone WAF custom rules
@@ -83,7 +83,7 @@ Relay mode forwards the original client TLS bytes; it does not create a new TLS 
 
 ## Security behavior
 
-- Proxying is disabled unless `PROXY_ENABLED=true`.
+- Proxying is disabled unless `PE=true`.
 - VLESS UUID validation is required before any outbound socket is opened.
 - UUID authentication, `AP`, and a non-empty `AH` exact-match allowlist are mandatory for all modes. A missing or invalid allowlist fails closed; a configured hostname does not authorize its subdomains.
 - Private/local IP literals are rejected by the VLESS parser.
@@ -111,11 +111,11 @@ Official references:
 
 1. Keep `workers_dev` enabled. Do not set `workers_dev = false` while this is the only public ingress; doing so removes the current production hostname. Do not disable it until a replacement Custom Domain or Route has been deployed and tested.
 2. Keep `HE=false`. The health endpoint is not required for proxy operation and only adds a public path.
-3. In Cloudflare Dashboard → Workers & Pages → this Worker → Settings → Variables and Secrets, create `PROXY_ENABLED` as a plaintext variable with value `false`. This switch is deliberately not stored in `wrangler.toml`. Confirm the UUID secret is provisioned, the selected outbound mode is configured, and any upstream credentials are stored as Worker Secrets rather than in source files.
+3. In Cloudflare Dashboard → Workers & Pages → this Worker → Settings → Variables and Secrets, create `PE` as a plaintext variable with value `false`. This switch is deliberately not stored in `wrangler.toml`. Confirm the UUID secret is provisioned, the selected outbound mode is configured, and any upstream credentials are stored as Worker Secrets rather than in source files.
 4. Configure a non-empty, narrow `AH` list containing every exact destination hostname required by the client. The Worker rejects requests when the list is missing, malformed, or does not contain the exact requested hostname. Do not use a general-purpose unrestricted destination policy.
 5. Keep `AP` as narrow as the actual application requires. Do not expand it simply to make a failed connection work.
 6. Do not treat a descriptive `User-Agent` as authentication. If BIC blocks a legitimate client, configure a truthful, descriptive application User-Agent in that client if it supports the header. Do not impersonate a browser or add a fake browser signature. If the client cannot control User-Agent and receives 1010, the reliable fix is to move to a Custom Domain/Route in a zone you control, not to weaken UUID validation.
-7. After settings are reviewed, change the dashboard variable `PROXY_ENABLED` to `true` for the controlled handshake and data-transfer tests below. If any test fails, change it back to `false` while diagnosing.
+7. After settings are reviewed, change the dashboard variable `PE` to `true` for the controlled handshake and data-transfer tests below. If any test fails, change it back to `false` while diagnosing.
 
 #### Access and WAF baseline
 
@@ -139,11 +139,11 @@ Access adds a pre-Worker identity gate, but it is not a substitute for applicati
 1. Run `npm ci`, `npm run check`, and `npx wrangler deploy --dry-run` locally or in CI.
 2. Verify the Cloudflare account and Worker name selected by Wrangler. This repository's config names the Worker `worker-v5-pluggable-v1`; do not deploy over a different production Worker by accident.
 3. Run `npm run deploy`. The script provisions/reuses the UUID secret without printing it. Preserve `.wrangler/proxy-uuid.txt` securely if this is the first generated UUID; never commit or share it.
-4. In Cloudflare Dashboard, set `PROXY_ENABLED=false`; verify `HE=false`, the intended `OM`, and the relevant upstream variables/secrets. Confirm no Access application/policy has been created for this hostname and no WAF rules have been configured.
+4. In Cloudflare Dashboard, set `PE=false`; verify `HE=false`, the intended `OM`, and the relevant upstream variables/secrets. Confirm no Access application/policy has been created for this hostname and no WAF rules have been configured.
 5. Test the public hostname's BIC behavior with the actual VLESS client. An HTTP 1010 response is an edge rejection before Worker execution; it is not a VLESS UUID or Worker routing error.
 6. Test a deliberately invalid UUID and verify that no outbound connection is opened. Then test a valid UUID against an explicitly authorized destination and verify bidirectional traffic, reconnect behavior, and sustained transfer.
 7. Verify the observed egress IP and country independently. A successful WebSocket connection does not prove a US exit location.
-8. Only after the controlled tests pass, change the dashboard variable `PROXY_ENABLED` to `true`. Keep a rollback path: set it back to `false` if the service behaves unexpectedly.
+8. Only after the controlled tests pass, change the dashboard variable `PE` to `true`. Keep a rollback path: set it back to `false` if the service behaves unexpectedly.
 
 #### What workers.dev does not provide for this service
 
@@ -200,7 +200,7 @@ A passing TypeScript build or unit-test suite is not a substitute for the zone-l
 ## Staged verification
 
 1. Deploy under the separate Worker name in `wrangler.toml`; do not overwrite an existing service.
-2. Set `OM=direct`, configure `UUID` and a narrow `AH`, and confirm the dashboard variable `PROXY_ENABLED=false`.
+2. Set `OM=direct`, configure `UUID` and a narrow `AH`, and confirm the dashboard variable `PE=false`.
 3. Confirm `/health` returns only `{ "ok": true }`. It intentionally does not report the selected mode or configuration and does not test outbound connectivity.
 4. Enable only for a controlled test and verify a permitted destination.
 5. Record the observed egress IP and independently check its geolocation; a successful request does not prove a US exit.
