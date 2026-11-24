@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CircuitBreakerRegistry } from "../src/circuit-breaker";
+import { CircuitBreakerRegistry } from "../src/index";
 
 describe("CircuitBreakerRegistry", () => {
   it("opens after the configured consecutive failure threshold", () => {
