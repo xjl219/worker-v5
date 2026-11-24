@@ -24,8 +24,8 @@ describe("secure deployment UUID handling", () => {
   });
 
   it("recognizes UUID in Wrangler JSON secret listings", () => {
-    expect(parseSecretNames('[{"name":"UUID","type":"secret_text"},{"name":"SOCKS5_PASSWORD"}]'))
-      .toEqual(new Set(["UUID", "SOCKS5_PASSWORD"]));
+    expect(parseSecretNames('[{"name":"UUID","type":"secret_text"},{"name":"SP"}]'))
+      .toEqual(new Set(["UUID", "SP"]));
   });
 
   it("fails closed on malformed Wrangler output rather than rotating credentials", () => {
