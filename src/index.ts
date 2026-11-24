@@ -98,7 +98,7 @@ export function parseAllowedHosts(raw: string | undefined): Set<string> {
   const hosts = new Set<string>();
   for (const entry of entries) {
     const value = entry.trim();
-    if (!value) throw new Error("ALLOWED_HOSTS contains an empty entry");
+    if (!value) throw new Error("AH contains an empty entry");
     hosts.add(normalizeDestinationHostname(value));
   }
   return hosts;
@@ -294,19 +294,19 @@ export function getPublicSurfaceResponse(request: Request, healthEnabled?: strin
 // Worker entry point and outbound transport
 interface Env {
   UUID: string;
-  ALLOWED_PORTS?: string;
-  ALLOWED_HOSTS?: string;
+  AP?: string;
+  AH?: string;
   PROXY_ENABLED?: string;
-  HEALTH_ENABLED?: string;
-  OUTBOUND_MODE?: string;
-  RELAY_ENDPOINTS?: string;
-  SOCKS5_HOST?: string;
-  SOCKS5_PORT?: string;
+  HE?: string;
+  OM?: string;
+  RE?: string;
+  H?: string;
+  P?: string;
   SOCKS5_USERNAME?: string;
   SOCKS5_PASSWORD?: string;
 }
 
-const DEFAULT_ALLOWED_PORTS = [80, 443, 8080, 8443, 2053, 2083, 2087, 2096];
+const DEFAULT_AP = [80, 443, 8080, 8443, 2053, 2083, 2087, 2096];
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_WS_BUFFERED_BYTES = 4 * 1024 * 1024;
 const SECURITY_HEADERS = {
@@ -330,7 +330,7 @@ function toBytes(data: unknown): Uint8Array {
 }
 
 function allowedHosts(env: Env): Set<string> {
-  return parseAllowedHosts(env.ALLOWED_HOSTS);
+  return parseAllowedHosts(env.AH);
 }
 
 function hasValidAllowedHosts(env: Env): boolean {
@@ -342,11 +342,11 @@ function hasValidAllowedHosts(env: Env): boolean {
 }
 
 function allowedPorts(env: Env): Set<number> {
-  const raw = env.ALLOWED_PORTS?.trim();
-  if (!raw) return new Set(DEFAULT_ALLOWED_PORTS);
+  const raw = env.AP?.trim();
+  if (!raw) return new Set(DEFAULT_AP);
   const ports = raw.split(",").map((value) => Number(value.trim()));
   if (ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535)) {
-    throw new Error("ALLOWED_PORTS contains an invalid port");
+    throw new Error("AP contains an invalid port");
   }
   return new Set(ports);
 }
@@ -405,10 +405,10 @@ async function connectViaSocks5(
   destinationHost: string,
   destinationPort: number,
 ): Promise<{ socket: ReturnType<typeof connect>; reader: SocketReader; writer: WritableStreamDefaultWriter<Uint8Array> }> {
-  if (!env.SOCKS5_HOST?.trim()) throw new Error("SOCKS5_HOST is not configured");
-  const proxyPort = Number(env.SOCKS5_PORT || "1080");
+  if (!env.H?.trim()) throw new Error("H is not configured");
+  const proxyPort = Number(env.P || "1080");
   if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
-    throw new Error("SOCKS5_PORT is invalid");
+    throw new Error("P is invalid");
   }
   const username = env.SOCKS5_USERNAME || "";
   const password = env.SOCKS5_PASSWORD || "";
@@ -419,7 +419,7 @@ async function connectViaSocks5(
   const passwordBytes = new TextEncoder().encode(password);
   if (usernameBytes.length > 255 || passwordBytes.length > 255) throw new Error("SOCKS5 credentials exceed protocol limits");
 
-  const socket = connect({ hostname: env.SOCKS5_HOST.trim(), port: proxyPort }, { allowHalfOpen: true });
+  const socket = connect({ hostname: env.H.trim(), port: proxyPort }, { allowHalfOpen: true });
   await socket.opened;
   const writer = socket.writable.getWriter();
   const reader = new SocketReader(socket.readable);
@@ -475,9 +475,9 @@ async function connectDirect(host: string, port: number): Promise<UpstreamConnec
 }
 
 function relayCandidates(env: Env): Array<{ hostname: string; port: number }> {
-  return (env.RELAY_ENDPOINTS || "").split(/[;,\n]+/).map((item) => item.trim()).filter(Boolean).map((item) => {
+  return (env.RE || "").split(/[;,\n]+/).map((item) => item.trim()).filter(Boolean).map((item) => {
     const match = /^([^:\s]+):(\d{1,5})$/.exec(item);
-    if (!match) throw new Error("RELAY_ENDPOINTS entries must use host:port format");
+    if (!match) throw new Error("RE entries must use host:port format");
     const port = Number(match[2]);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid relay port");
     return { hostname: match[1], port };
@@ -492,12 +492,12 @@ function stableIndex(value: string, count: number): number {
 
 function isOutboundConfigured(env: Env): boolean {
   try {
-    const mode = (env.OUTBOUND_MODE || "direct").trim().toLowerCase();
+    const mode = (env.OM || "direct").trim().toLowerCase();
     if (mode === "direct") return true;
     if (mode === "relay") return relayCandidates(env).length > 0;
     if (mode === "socks5") {
-      if (!env.SOCKS5_HOST?.trim()) return false;
-      const port = Number(env.SOCKS5_PORT || "1080");
+      if (!env.H?.trim()) return false;
+      const port = Number(env.P || "1080");
       if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
       return (Boolean(env.SOCKS5_USERNAME) === Boolean(env.SOCKS5_PASSWORD));
     }
@@ -515,7 +515,7 @@ const relayCircuitBreakers = new CircuitBreakerRegistry({
 async function connectViaRelay(env: Env, destinationHost: string, destinationPort: number): Promise<UpstreamConnection> {
   if (destinationPort !== 443) throw new Error("SNI relay mode supports destination port 443 only");
   const candidates = relayCandidates(env);
-  if (!candidates.length) throw new Error("RELAY_ENDPOINTS is not configured");
+  if (!candidates.length) throw new Error("RE is not configured");
 
   // Preserve deterministic preference, then fail over only among explicitly configured relays.
   const start = stableIndex(destinationHost, candidates.length);
@@ -546,11 +546,11 @@ async function connectViaRelay(env: Env, destinationHost: string, destinationPor
 }
 
 async function connectOutbound(env: Env, host: string, port: number): Promise<UpstreamConnection> {
-  const mode = (env.OUTBOUND_MODE || "direct").trim().toLowerCase();
+  const mode = (env.OM || "direct").trim().toLowerCase();
   if (mode === "direct") return connectDirect(host, port);
   if (mode === "socks5") return connectViaSocks5(env, host, port);
   if (mode === "relay") return connectViaRelay(env, host, port);
-  throw new Error("OUTBOUND_MODE must be direct, relay, or socks5");
+  throw new Error("OM must be direct, relay, or socks5");
 }
 
 async function handleWebSocket(request: Request, env: Env): Promise<Response> {
@@ -622,7 +622,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const publicSurfaceResponse = getPublicSurfaceResponse(request, env.HEALTH_ENABLED);
+    const publicSurfaceResponse = getPublicSurfaceResponse(request, env.HE);
     if (publicSurfaceResponse) return publicSurfaceResponse;
     return handleWebSocket(request, env);
   },
