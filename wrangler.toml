@@ -9,7 +9,7 @@ region = "gcp:us-central1"
 enabled = true
 
 # Non-secret runtime configuration.
-# PROXY_ENABLED is intentionally managed in the Cloudflare dashboard.
+# PE is intentionally managed in the Cloudflare dashboard.
 [vars]
 HE = "false"
 OM = "direct"
@@ -20,5 +20,5 @@ P = "1080"
 
 # Secrets must be configured separately; never commit credentials here:
 #   npx wrangler secret put UUID
-#   npx wrangler secret put SOCKS5_USERNAME
-#   npx wrangler secret put SOCKS5_PASSWORD
+#   npx wrangler secret put SU
+#   npx wrangler secret put SP
