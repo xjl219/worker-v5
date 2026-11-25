@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseV1Request, encodeS5Address } from "../src/index";
-import { isAllowedDestinationHost, normalizeDestinationHostname, parseAllowedHosts } from "../src/index";
+import { isAllowedDestinationHost, isDestinationHostAllowed, normalizeDestinationHostname, parseAllowedHosts } from "../src/index";
 
 const UUID = "00000000-0000-4000-8000-000000000001";
 
@@ -100,6 +100,22 @@ describe("destination hostname allowlist", () => {
   it("returns an empty set for a missing allowlist so callers can fail closed", () => {
     expect(parseAllowedHosts(undefined).size).toBe(0);
     expect(parseAllowedHosts("").size).toBe(0);
+  });
+
+  it("skips hostname matching when AH is unset or empty", () => {
+    expect(isDestinationHostAllowed("example.com", undefined)).toBe(true);
+    expect(isDestinationHostAllowed("example.com", "")).toBe(true);
+    expect(isDestinationHostAllowed("example.com", "   ")).toBe(true);
+  });
+
+  it("enforces exact hostname matching when AH is configured", () => {
+    expect(isDestinationHostAllowed("example.com", "example.com")).toBe(true);
+    expect(isDestinationHostAllowed("sub.example.com", "example.com")).toBe(false);
+  });
+
+  it("rejects a configured but malformed AH value", () => {
+    expect(isDestinationHostAllowed("example.com", "example.com,")).toBe(false);
+    expect(isDestinationHostAllowed("example.com", "*.example.com")).toBe(false);
   });
 
   it("rejects wildcard entries and URL-like allowlist values", () => {
