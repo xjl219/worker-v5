@@ -149,14 +149,14 @@ Access adds a pre-Worker identity gate, but it is not a substitute for applicati
 
 - No owner-managed zone WAF custom rule that blocks every path except `/ws`.
 - No owner-managed zone rate-limiting rule scoped to `/ws`.
-- No reliable global concurrent-connection or byte quota from Worker isolate-local state.
+- Per-isolate active connection cap (50), 2-minute idle timeout, and 10-minute maximum lifetime. These limits are isolate-local and do not provide a reliable global concurrent-connection or byte quota.
 - No guarantee that BIC accepts every non-browser WebSocket client.
 
 The application still returns a generic 404 for root, unknown paths, non-GET requests, and non-WebSocket requests to `/ws`; `/health` remains disabled by default. This reduces the HTTP surface but does not stop a scanner from discovering the WebSocket endpoint. The VLESS UUID is the actual application credential.
 
 If traffic volume or abuse risk grows, the production-grade path is to attach a Custom Domain in a zone you control, test it, add a WAF custom rule to allow only `/ws`, add a rate-limit rule for the handshake, and then disable `workers.dev`. Do not disable `workers.dev` before the replacement endpoint is confirmed. Cloudflare WAF evaluates the initial HTTP WebSocket Upgrade; it does not inspect frames after the connection is established.
 
-The Worker code cannot provide a reliable account-wide rate or concurrent-connection quota across independent isolates. A reliable global concurrency/byte quota requires a shared coordinator such as a Durable Object or an equivalent external control plane; that remains a separate implementation gate and is not claimed by the current PR.
+The Worker code cannot provide a reliable account-wide rate or concurrent-connection quota across independent isolates. The in-memory connection cap limits damage within one isolate only. A reliable global concurrency/byte quota requires a shared coordinator such as a Durable Object or an equivalent external control plane; that remains a separate implementation gate and is not claimed by the current PR.
 
 ### Relay circuit breaker behavior
 

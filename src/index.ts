@@ -326,9 +326,14 @@ interface Env {
 const DEFAULT_AP = [80, 443, 8080, 8443, 2053, 2083, 2087, 2096];
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_WS_BUFFERED_BYTES = 4 * 1024 * 1024;
+const MAX_CONNECTIONS_PER_ISOLATE = 50;
+const MAX_CONNECTION_LIFETIME_MS = 10 * 60 * 1000;
+const IDLE_CONNECTION_TIMEOUT_MS = 2 * 60 * 1000;
+let activeConnections = 0;
 
-// DEBUG BUILD: set to false before production deployment to silence diagnostics.
-const DEBUG_LOG = true;
+// Diagnostics are disabled in production. Never log raw frame prefixes: the
+// initial VLESS frame contains credential bytes.
+const DEBUG_LOG = false;
 
 function debugLog(stage: string, details: Record<string, unknown> = {}): void {
   if (!DEBUG_LOG) return;
@@ -415,7 +420,7 @@ class SocketReader {
     return result;
   }
 
-  async pumpTo(websocket: WebSocket, isClosed: () => boolean): Promise<void> {
+  async pumpTo(websocket: WebSocket, isClosed: () => boolean, onActivity: () => void): Promise<void> {
     try {
       while (!isClosed()) {
         let chunk: Uint8Array | undefined;
@@ -428,6 +433,7 @@ class SocketReader {
           chunk = value;
         }
         if (chunk?.length) {
+          onActivity();
           if (websocket.readyState !== WebSocket.OPEN) break;
           if (websocket.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
             try { websocket.close(1013, "client cannot keep up"); } catch { /* already closed */ }
@@ -629,6 +635,10 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
     debugLog("WS_REJECT", { requestId, stage: "CONFIGURATION", uuidConfigured: Boolean(env.UUID), outboundConfigured: isOutboundConfigured(env) });
     return response("Not found", 404);
   }
+  if (activeConnections >= MAX_CONNECTIONS_PER_ISOLATE) {
+    debugLog("WS_REJECT", { requestId, stage: "CONNECTION_LIMIT" });
+    return response("Service unavailable", 503, { "retry-after": "30" });
+  }
 
   const pair = new WebSocketPair();
   const client = pair[0];
@@ -637,6 +647,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   // toBytes also supports Blob defensively if the runtime type is changed later.
   server.binaryType = "arraybuffer";
   server.accept({ allowHalfOpen: true });
+  activeConnections += 1;
 
   let upstream: ReturnType<typeof connect> | undefined;
   let upstreamWriter: WritableStreamDefaultWriter<Uint8Array> | undefined;
@@ -644,10 +655,20 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   let closed = false;
   let messageIndex = 0;
   let messageChain = Promise.resolve();
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let lifetimeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const refreshIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { void closeBoth(1001, "idle timeout"); }, IDLE_CONNECTION_TIMEOUT_MS);
+  };
 
   const closeBoth = async (code = 1000, reason = "connection closed") => {
     if (closed) return;
     closed = true;
+    if (idleTimer) clearTimeout(idleTimer);
+    if (lifetimeTimer) clearTimeout(lifetimeTimer);
+    activeConnections = Math.max(0, activeConnections - 1);
     debugLog("WS_CLOSE", {
       requestId, code, reason, initialized,
       lifetimeMs: Date.now() - startedAt,
@@ -659,6 +680,9 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
     try { await upstream?.close(); } catch (error) { debugLog("UPSTREAM_SOCKET_CLOSE_ERROR", { requestId, ...debugError(error) }); }
   };
 
+  refreshIdleTimer();
+  lifetimeTimer = setTimeout(() => { void closeBoth(1001, "maximum lifetime reached"); }, MAX_CONNECTION_LIFETIME_MS);
+
   debugLog("WS_ACCEPTED", { requestId, readyState: server.readyState });
 
   server.addEventListener("message", (event: MessageEvent) => {
@@ -669,6 +693,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
         debugLog("MESSAGE_IGNORED_CLOSED", { requestId, messageIndex: currentMessage });
         return;
       }
+      refreshIdleTimer();
 
       let stage = "MESSAGE_DECODE";
       const messageStartedAt = Date.now();
@@ -689,8 +714,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
         debugLog("MESSAGE_DECODED", {
           requestId, messageIndex: currentMessage,
           byteLength: bytes.byteLength,
-          prefixHex: Array.from(bytes.subarray(0, Math.min(8, bytes.length))).map((b) => b.toString(16).padStart(2, "0")).join(" "),
-          // UUID bytes and application payload are intentionally never logged.
+          // Do not log frame contents or prefixes; the first VLESS frame contains the UUID.
         });
         if (bytes.byteLength > MAX_MESSAGE_BYTES) {
           stage = "MESSAGE_SIZE_CHECK";
@@ -745,7 +769,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
             debugLog("UPSTREAM_WRITE_SUCCESS", { requestId, payloadLength: parsed.payload.byteLength });
           }
 
-          void connection.reader.pumpTo(server, () => closed)
+          void connection.reader.pumpTo(server, () => closed, refreshIdleTimer)
             .then(() => debugLog("UPSTREAM_READ_PUMP_ENDED", { requestId }))
             .finally(() => { if (!closed) void closeBoth(1000, "upstream ended"); })
             .catch((error: unknown) => {
@@ -777,7 +801,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
 
   server.addEventListener("close", (event: CloseEvent) => {
     debugLog("WS_PEER_CLOSE", { requestId, code: event.code, reason: event.reason, wasClean: event.wasClean });
-    void closeBoth();
+    void closeBoth(1000, "client closed");
   });
   server.addEventListener("error", (event: Event) => {
     debugLog("WS_ERROR_EVENT", { requestId, eventType: event.type });
