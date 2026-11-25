@@ -92,6 +92,22 @@ export function normalizeDestinationHostname(input: string): string {
   return host;
 }
 
+export function normalizeParsedDestination(input: string): string {
+  const host = input.trim().toLowerCase();
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const octets = ipv4.slice(1).map(Number);
+    if (octets.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return host;
+    throw new Error("Invalid IPv4 destination");
+  }
+  if (host.includes(":")) {
+    const groups = host.split(":");
+    if (groups.length === 8 && groups.every((part) => /^[0-9a-f]{1,4}$/.test(part))) return host;
+    throw new Error("Invalid IPv6 destination");
+  }
+  return normalizeDestinationHostname(host);
+}
+
 export function parseAllowedHosts(raw: string | undefined): Set<string> {
   if (!raw?.trim()) return new Set();
   const entries = raw.split(",");
@@ -171,6 +187,7 @@ export function parseV1Request(data: Uint8Array, expectedUuid: string): ParsedRe
   if (mismatch !== 0) throw new Error("Invalid V1 UUID");
 
   const version = data[0];
+  if (version !== 0x00) throw new Error("Unsupported V1 version");
   const addonLength = data[17];
   const commandOffset = 18 + addonLength;
   if (data.length < commandOffset + 4) throw new Error("Incomplete V1 address header");
@@ -590,21 +607,33 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
       if (bytes.byteLength > MAX_MESSAGE_BYTES) throw new Error("WebSocket message exceeds 8 MiB limit");
 
       if (!initialized) {
-        const parsed = parseV1Request(bytes, env.UUID);
-        if (!allowedPorts(env).has(parsed.port)) throw new Error("Destination port is not allowed");
-        const destinationHost = normalizeDestinationHostname(parsed.hostname);
-        if (!isDestinationHostAllowed(destinationHost, env.AH)) throw new Error("Destination host is not allowed");
-
-        const connection = await connectOutbound(env, parsed.hostname, parsed.port);
-        upstream = connection.socket;
-        upstreamWriter = connection.writer;
-        initialized = true;
-        server.send(new Uint8Array([parsed.version, 0]));
-        if (parsed.payload.byteLength) await upstreamWriter.write(parsed.payload);
-        void connection.reader.pumpTo(server, () => closed)
-          .finally(() => { if (!closed) void closeBoth(1000, "upstream ended"); })
-          .catch(() => closeBoth(1011, "upstream read failed"));
-        return;
+        let stage = "PARSE";
+        try {
+          const parsed = parseV1Request(bytes, env.UUID);
+          stage = "PORT_CHECK";
+          if (!allowedPorts(env).has(parsed.port)) throw new Error("Destination port is not allowed");
+          stage = "HOST_CHECK";
+          const destinationHost = normalizeParsedDestination(parsed.hostname);
+          if (!isDestinationHostAllowed(destinationHost, env.AH)) throw new Error("Destination host is not allowed");
+          stage = "TCP_CONNECT";
+          const connection = await connectOutbound(env, destinationHost, parsed.port);
+          stage = "INITIALIZED";
+          upstream = connection.socket;
+          upstreamWriter = connection.writer;
+          initialized = true;
+          server.send(new Uint8Array([parsed.version, 0]));
+          if (parsed.payload.byteLength) await upstreamWriter.write(parsed.payload);
+          void connection.reader.pumpTo(server, () => closed)
+            .finally(() => { if (!closed) void closeBoth(1000, "upstream ended"); })
+            .catch(() => closeBoth(1011, "upstream read failed"));
+          return;
+        } catch (error) {
+          console.warn("worker-v5 initialization rejected", {
+            stage,
+            error: error instanceof Error ? error.message : "unknown error",
+          });
+          throw error;
+        }
       }
 
       if (!upstreamWriter) throw new Error("Upstream is not ready");
