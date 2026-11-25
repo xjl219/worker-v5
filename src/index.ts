@@ -326,6 +326,25 @@ interface Env {
 const DEFAULT_AP = [80, 443, 8080, 8443, 2053, 2083, 2087, 2096];
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_WS_BUFFERED_BYTES = 4 * 1024 * 1024;
+
+// DEBUG BUILD: set to false before production deployment to silence diagnostics.
+const DEBUG_LOG = true;
+
+function debugLog(stage: string, details: Record<string, unknown> = {}): void {
+  if (!DEBUG_LOG) return;
+  console.log("[worker-v5:DEBUG]", {
+    timestamp: new Date().toISOString(),
+    stage,
+    ...details,
+  });
+}
+
+function debugError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return { errorName: error.name, errorMessage: error.message, errorStack: error.stack };
+  }
+  return { errorName: "UnknownError", errorMessage: String(error) };
+}
 const SECURITY_HEADERS = {
   "cache-control": "no-store",
   "x-content-type-options": "nosniff",
@@ -572,12 +591,37 @@ async function connectOutbound(env: Env, host: string, port: number): Promise<Up
 }
 
 async function handleWebSocket(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "GET") return response("Not found", 404);
-  if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+  const requestId = crypto.randomUUID();
+  const startedAt = Date.now();
+  debugLog("WS_REQUEST", {
+    requestId,
+    method: request.method,
+    url: request.url,
+    upgrade: request.headers.get("Upgrade"),
+    protocol: request.headers.get("Sec-WebSocket-Protocol"),
+    proxyEnabled: env.PE === "true",
+    uuidConfigured: Boolean(env.UUID),
+    uuidFormatValid: Boolean(env.UUID && /^[0-9a-f]{8}-?[0-9a-f]{4}-?4?[0-9a-f]{3}-?[89ab]?[0-9a-f]{3}-?[0-9a-f]{12}$/i.test(env.UUID)),
+    outboundMode: (env.OM || "direct").trim().toLowerCase(),
+    allowedPorts: env.AP || "(default)",
+    allowedHostsConfigured: Boolean(env.AH?.trim()),
+    outboundConfigured: isOutboundConfigured(env),
+  });
+
+  if (request.method !== "GET") {
+    debugLog("WS_REJECT", { requestId, stage: "HTTP_METHOD", method: request.method });
     return response("Not found", 404);
   }
-  if (env.PE !== "true") return response("Not found", 404);
+  if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+    debugLog("WS_REJECT", { requestId, stage: "UPGRADE_HEADER" });
+    return response("Not found", 404);
+  }
+  if (env.PE !== "true") {
+    debugLog("WS_REJECT", { requestId, stage: "PROXY_DISABLED" });
+    return response("Not found", 404);
+  }
   if (!env.UUID || !isOutboundConfigured(env)) {
+    debugLog("WS_REJECT", { requestId, stage: "CONFIGURATION", uuidConfigured: Boolean(env.UUID), outboundConfigured: isOutboundConfigured(env) });
     return response("Not found", 404);
   }
 
@@ -590,62 +634,143 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   let upstreamWriter: WritableStreamDefaultWriter<Uint8Array> | undefined;
   let initialized = false;
   let closed = false;
+  let messageIndex = 0;
   let messageChain = Promise.resolve();
 
   const closeBoth = async (code = 1000, reason = "connection closed") => {
     if (closed) return;
     closed = true;
-    try { server.close(code, reason.slice(0, 100)); } catch { /* already closed */ }
-    try { await upstreamWriter?.close(); } catch { /* already closed */ }
-    try { await upstream?.close(); } catch { /* already closed */ }
+    debugLog("WS_CLOSE", {
+      requestId, code, reason, initialized,
+      lifetimeMs: Date.now() - startedAt,
+      messageCount: messageIndex,
+      upstreamConnected: Boolean(upstream),
+    });
+    try { server.close(code, reason.slice(0, 100)); } catch (error) { debugLog("WS_CLOSE_SERVER_ERROR", { requestId, ...debugError(error) }); }
+    try { await upstreamWriter?.close(); } catch (error) { debugLog("UPSTREAM_WRITER_CLOSE_ERROR", { requestId, ...debugError(error) }); }
+    try { await upstream?.close(); } catch (error) { debugLog("UPSTREAM_SOCKET_CLOSE_ERROR", { requestId, ...debugError(error) }); }
   };
 
-  server.addEventListener("message", (event: MessageEvent) => {
-    messageChain = messageChain.then(async () => {
-      if (closed) return;
-      const bytes = toBytes(event.data);
-      if (bytes.byteLength > MAX_MESSAGE_BYTES) throw new Error("WebSocket message exceeds 8 MiB limit");
+  debugLog("WS_ACCEPTED", { requestId, readyState: server.readyState });
 
-      if (!initialized) {
-        let stage = "PARSE";
-        try {
+  server.addEventListener("message", (event: MessageEvent) => {
+    messageIndex += 1;
+    const currentMessage = messageIndex;
+    messageChain = messageChain.then(async () => {
+      if (closed) {
+        debugLog("MESSAGE_IGNORED_CLOSED", { requestId, messageIndex: currentMessage });
+        return;
+      }
+
+      let stage = "MESSAGE_DECODE";
+      const messageStartedAt = Date.now();
+      try {
+        const dataType = event.data instanceof ArrayBuffer ? "ArrayBuffer"
+          : ArrayBuffer.isView(event.data) ? "ArrayBufferView" : typeof event.data;
+        debugLog("MESSAGE_RECEIVED", {
+          requestId, messageIndex: currentMessage, dataType,
+          rawLength: typeof event.data === "string" ? event.data.length : (event.data as { byteLength?: number })?.byteLength,
+          initialized,
+        });
+
+        const bytes = toBytes(event.data);
+        debugLog("MESSAGE_DECODED", {
+          requestId, messageIndex: currentMessage,
+          byteLength: bytes.byteLength,
+          prefixHex: Array.from(bytes.subarray(0, Math.min(8, bytes.length))).map((b) => b.toString(16).padStart(2, "0")).join(" "),
+          // UUID bytes and application payload are intentionally never logged.
+        });
+        if (bytes.byteLength > MAX_MESSAGE_BYTES) {
+          stage = "MESSAGE_SIZE_CHECK";
+          throw new Error("WebSocket message exceeds 8 MiB limit");
+        }
+
+        if (!initialized) {
+          stage = "VLESS_PARSE";
+          debugLog("VLESS_PARSE_START", { requestId, messageIndex: currentMessage, messageLength: bytes.byteLength });
           const parsed = parseV1Request(bytes, env.UUID);
+          debugLog("VLESS_PARSE_SUCCESS", {
+            requestId, messageIndex: currentMessage,
+            version: parsed.version, command: "TCP",
+            destination: parsed.hostname, port: parsed.port,
+            payloadLength: parsed.payload.byteLength,
+            uuidMatched: true,
+          });
+
           stage = "PORT_CHECK";
-          if (!allowedPorts(env).has(parsed.port)) throw new Error("Destination port is not allowed");
+          const ports = allowedPorts(env);
+          debugLog("PORT_CHECK_START", { requestId, destinationPort: parsed.port, configuredPorts: Array.from(ports) });
+          if (!ports.has(parsed.port)) throw new Error("Destination port is not allowed");
+          debugLog("PORT_CHECK_SUCCESS", { requestId, destinationPort: parsed.port });
+
           stage = "HOST_CHECK";
           const destinationHost = normalizeParsedDestination(parsed.hostname);
+          debugLog("HOST_CHECK_START", { requestId, destinationHost, allowlistConfigured: Boolean(env.AH?.trim()) });
           if (!isDestinationHostAllowed(destinationHost, env.AH)) throw new Error("Destination host is not allowed");
+          debugLog("HOST_CHECK_SUCCESS", { requestId, destinationHost });
+
           stage = "TCP_CONNECT";
+          const connectStartedAt = Date.now();
+          const mode = (env.OM || "direct").trim().toLowerCase();
+          debugLog("TCP_CONNECT_START", { requestId, mode, destinationHost, destinationPort: parsed.port });
           const connection = await connectOutbound(env, destinationHost, parsed.port);
-          stage = "INITIALIZED";
+          debugLog("TCP_CONNECT_SUCCESS", {
+            requestId, mode, destinationHost, destinationPort: parsed.port,
+            connectDurationMs: Date.now() - connectStartedAt,
+          });
+
+          stage = "INITIALIZE_STATE";
           upstream = connection.socket;
           upstreamWriter = connection.writer;
           initialized = true;
           server.send(new Uint8Array([parsed.version, 0]));
-          if (parsed.payload.byteLength) await upstreamWriter.write(parsed.payload);
-          void connection.reader.pumpTo(server, () => closed)
-            .finally(() => { if (!closed) void closeBoth(1000, "upstream ended"); })
-            .catch(() => closeBoth(1011, "upstream read failed"));
-          return;
-        } catch (error) {
-          console.warn("worker-v5 initialization rejected", {
-            stage,
-            error: error instanceof Error ? error.message : "unknown error",
-          });
-          throw error;
-        }
-      }
+          debugLog("VLESS_RESPONSE_SENT", { requestId, responseHeaderHex: "00 00" });
 
-      if (!upstreamWriter) throw new Error("Upstream is not ready");
-      await upstreamWriter.write(bytes);
+          if (parsed.payload.byteLength) {
+            stage = "UPSTREAM_INITIAL_WRITE";
+            debugLog("UPSTREAM_WRITE_START", { requestId, payloadLength: parsed.payload.byteLength });
+            await upstreamWriter.write(parsed.payload);
+            debugLog("UPSTREAM_WRITE_SUCCESS", { requestId, payloadLength: parsed.payload.byteLength });
+          }
+
+          void connection.reader.pumpTo(server, () => closed)
+            .then(() => debugLog("UPSTREAM_READ_PUMP_ENDED", { requestId }))
+            .finally(() => { if (!closed) void closeBoth(1000, "upstream ended"); })
+            .catch((error: unknown) => {
+              debugLog("UPSTREAM_READ_PUMP_ERROR", { requestId, ...debugError(error) });
+              return closeBoth(1011, "upstream read failed");
+            });
+          debugLog("INITIALIZATION_SUCCESS", { requestId, durationMs: Date.now() - messageStartedAt });
+          return;
+        }
+
+        stage = "UPSTREAM_WRITE";
+        if (!upstreamWriter) throw new Error("Upstream is not ready");
+        debugLog("UPSTREAM_WRITE_START", { requestId, messageIndex: currentMessage, byteLength: bytes.byteLength });
+        await upstreamWriter.write(bytes);
+        debugLog("UPSTREAM_WRITE_SUCCESS", { requestId, messageIndex: currentMessage, byteLength: bytes.byteLength });
+      } catch (error) {
+        debugLog("MESSAGE_PROCESSING_FAILED", {
+          requestId, messageIndex: currentMessage, stage,
+          durationMs: Date.now() - messageStartedAt,
+          ...debugError(error),
+        });
+        await closeBoth(1008, "connection rejected");
+      }
     }).catch(async (error: unknown) => {
-      // Never disclose whether authentication, destination policy, or upstream setup failed.
-      await closeBoth(1008, "connection rejected");
+      debugLog("MESSAGE_CHAIN_UNHANDLED_ERROR", { requestId, messageIndex: currentMessage, ...debugError(error) });
+      await closeBoth(1011, "internal error");
     });
   });
 
-  server.addEventListener("close", () => { void closeBoth(); });
-  server.addEventListener("error", () => { void closeBoth(1011, "websocket error"); });
+  server.addEventListener("close", (event: CloseEvent) => {
+    debugLog("WS_PEER_CLOSE", { requestId, code: event.code, reason: event.reason, wasClean: event.wasClean });
+    void closeBoth();
+  });
+  server.addEventListener("error", (event: Event) => {
+    debugLog("WS_ERROR_EVENT", { requestId, eventType: event.type });
+    void closeBoth(1011, "websocket error");
+  });
 
   return new Response(null, { status: 101, webSocket: client });
 }
