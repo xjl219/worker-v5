@@ -359,9 +359,14 @@ function response(body: BodyInit | null, status: number, headers?: HeadersInit):
 }
 
 
-function toBytes(data: unknown): Uint8Array {
+export async function toBytes(data: unknown): Promise<Uint8Array> {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  // Cloudflare Workers may deliver binary frames as Blob when
+  // websocket_standard_binary_type is enabled by the compatibility date.
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    return new Uint8Array(await data.arrayBuffer());
+  }
   throw new Error("Only binary WebSocket messages are supported");
 }
 
@@ -628,6 +633,9 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
+  // Keep the existing synchronous binary-frame path on Workers whose default is Blob.
+  // toBytes also supports Blob defensively if the runtime type is changed later.
+  server.binaryType = "arraybuffer";
   server.accept({ allowHalfOpen: true });
 
   let upstream: ReturnType<typeof connect> | undefined;
@@ -666,14 +674,18 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
       const messageStartedAt = Date.now();
       try {
         const dataType = event.data instanceof ArrayBuffer ? "ArrayBuffer"
-          : ArrayBuffer.isView(event.data) ? "ArrayBufferView" : typeof event.data;
+          : ArrayBuffer.isView(event.data) ? "ArrayBufferView"
+          : typeof Blob !== "undefined" && event.data instanceof Blob ? "Blob" : typeof event.data;
         debugLog("MESSAGE_RECEIVED", {
           requestId, messageIndex: currentMessage, dataType,
-          rawLength: typeof event.data === "string" ? event.data.length : (event.data as { byteLength?: number })?.byteLength,
+          rawLength: typeof event.data === "string" ? event.data.length
+            : event.data && typeof event.data === "object" && "byteLength" in event.data
+              ? (event.data as { byteLength?: number }).byteLength
+              : typeof Blob !== "undefined" && event.data instanceof Blob ? event.data.size : undefined,
           initialized,
         });
 
-        const bytes = toBytes(event.data);
+        const bytes = await toBytes(event.data);
         debugLog("MESSAGE_DECODED", {
           requestId, messageIndex: currentMessage,
           byteLength: bytes.byteLength,
