@@ -329,13 +329,14 @@ function toBytes(data: unknown): Uint8Array {
   throw new Error("Only binary WebSocket messages are supported");
 }
 
-function allowedHosts(env: Env): Set<string> {
-  return parseAllowedHosts(env.AH);
-}
-
-function hasValidAllowedHosts(env: Env): boolean {
+/**
+ * An unset or empty AH disables only hostname allowlist matching.
+ * A configured but malformed AH rejects the destination.
+ */
+export function isDestinationHostAllowed(hostname: string, rawAllowedHosts: string | undefined): boolean {
+  if (!rawAllowedHosts?.trim()) return true;
   try {
-    return allowedHosts(env).size > 0;
+    return isAllowedDestinationHost(hostname, parseAllowedHosts(rawAllowedHosts));
   } catch {
     return false;
   }
@@ -559,7 +560,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
     return response("Not found", 404);
   }
   if (env.PE !== "true") return response("Not found", 404);
-  if (!env.UUID || !isOutboundConfigured(env) || !hasValidAllowedHosts(env)) {
+  if (!env.UUID || !isOutboundConfigured(env)) {
     return response("Not found", 404);
   }
 
@@ -592,7 +593,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
         const parsed = parseV1Request(bytes, env.UUID);
         if (!allowedPorts(env).has(parsed.port)) throw new Error("Destination port is not allowed");
         const destinationHost = normalizeDestinationHostname(parsed.hostname);
-        if (!allowedHosts(env).has(destinationHost)) throw new Error("Destination host is not allowed");
+        if (!isDestinationHostAllowed(destinationHost, env.AH)) throw new Error("Destination host is not allowed");
 
         const connection = await connectOutbound(env, parsed.hostname, parsed.port);
         upstream = connection.socket;
