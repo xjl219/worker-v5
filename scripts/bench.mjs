@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 
 const DEFAULT_HOST = "v5.xjl.dpdns.org";
 const DEFAULT_PORT = 443;
-const DEFAULT_TARGET = "cp.cloudflare.com:80";
+const DEFAULT_TARGET = "www.gstatic.com:80";
 const DEFAULT_TARGET_PATH = "/generate_204";
 const DEFAULT_RUNS = 3;
 const DEFAULT_TIMEOUT_MS = 5000;

@@ -538,7 +538,7 @@ export class SocketReader {
 
     try {
       while (!isClosed()) {
-        if (websocket.readyState !== WS_OPEN_READY_STATE) break;
+        if (websocket.readyState > WS_OPEN_READY_STATE) break;
         if (websocket.bufferedAmount >= highWaterBytes) {
           if (!(await waitForBackpressure())) break;
         }
@@ -874,6 +874,11 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
     initialized = true;
     connecting = false;
 
+    // Send the 2-byte VLESS response header immediately so clients that send
+    // a header-only first frame (and wait for [version, 0] before sending
+    // application payload) never deadlock.
+    server.send(new Uint8Array([version, 0]));
+
     if (initialPayload.byteLength) {
       writeToUpstream(initialPayload);
     }
@@ -885,8 +890,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
       pendingUpstreamBytes = 0;
     }
 
-    const responseHeader = new Uint8Array([version, 0]);
-    void connection.reader.pumpTo(server, () => closed, markActivity, responseHeader)
+    void connection.reader.pumpTo(server, () => closed, markActivity)
       .then(
         () => {
           if (DEBUG_LOG) debugLog("UPSTREAM_READ_PUMP_ENDED", { requestId });
@@ -1054,12 +1058,15 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
     void closeBoth(1011, "websocket error");
   });
 
-  // Start processing 0-RTT early data immediately so the outbound TCP dial and
-  // initial TLS ClientHello overlap with the 101 Switching Protocols response.
+  // Process 0-RTT early data on the microtask immediately after returning 101
+  // so the upgrade response flushes while the outbound TCP dial overlaps.
   const earlyData = decodeEarlyDataHeader(request.headers.get("Sec-WebSocket-Protocol"));
   if (earlyData) {
-    messageIndex += 1;
-    handleDecodedFrame(earlyData, messageIndex);
+    queueMicrotask(() => {
+      if (closed) return;
+      messageIndex += 1;
+      handleDecodedFrame(earlyData, messageIndex);
+    });
   }
 
   return new Response(null, { status: 101, webSocket: client });
