@@ -2,8 +2,10 @@ name = "worker-v5"
 main = "src/index.ts"
 compatibility_date = "2026-11-23"
 
-[placement]
-region = "gcp:us-central1"
+# Run at the nearest Cloudflare edge PoP by default to avoid cross-region detours.
+# Uncomment [placement] only if a specific egress region is explicitly required.
+# [placement]
+# region = "gcp:us-central1"
 
 [observability]
 enabled = true

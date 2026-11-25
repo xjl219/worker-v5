@@ -140,10 +140,20 @@ export type ParsedRequest = {
   payload: Uint8Array;
 };
 
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const UTF8_ENCODER = new TextEncoder();
+
+let cachedUuidRaw: string | undefined;
+let cachedUuidBytes: Uint8Array | undefined;
+
 function uuidToBytes(uuid: string): Uint8Array {
+  if (uuid === cachedUuidRaw && cachedUuidBytes) return cachedUuidBytes;
   const hex = uuid.replaceAll("-", "").toLowerCase();
   if (!/^[0-9a-f]{32}$/.test(hex)) throw new Error("UUID must be a valid 32-character UUID");
-  return Uint8Array.from(hex.match(/.{2}/g)!, (part) => Number.parseInt(part, 16));
+  const bytes = Uint8Array.from(hex.match(/.{2}/g)!, (part) => Number.parseInt(part, 16));
+  cachedUuidRaw = uuid;
+  cachedUuidBytes = bytes;
+  return bytes;
 }
 
 function bytesToIPv6(bytes: Uint8Array): string {
@@ -209,7 +219,7 @@ export function parseV1Request(data: Uint8Array, expectedUuid: string): ParsedRe
     if (data.length < addressOffset + 1) throw new Error("Incomplete domain length");
     addressLength = data[addressOffset++];
     if (addressLength < 1 || data.length < addressOffset + addressLength) throw new Error("Invalid domain address");
-    const decodedHostname = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(data.subarray(addressOffset, addressOffset + addressLength));
+    const decodedHostname = UTF8_DECODER.decode(data.subarray(addressOffset, addressOffset + addressLength));
     hostname = normalizeDestinationHostname(decodedHostname);
   } else if (addressType === 0x03) {
     addressLength = 16;
@@ -231,7 +241,7 @@ export function parseV1Request(data: Uint8Array, expectedUuid: string): ParsedRe
   }
 
   const payloadOffset = addressOffset + addressLength;
-  return { version, hostname, port, payload: data.slice(payloadOffset) };
+  return { version, hostname, port, payload: data.subarray(payloadOffset) };
 }
 
 export function encodeS5Address(hostname: string): Uint8Array {
@@ -263,7 +273,7 @@ export function encodeS5Address(hostname: string): Uint8Array {
     });
     return new Uint8Array([4, ...bytes]);
   }
-  const domain = new TextEncoder().encode(host);
+  const domain = UTF8_ENCODER.encode(host);
   if (!domain.length || domain.length > 255) throw new Error("Invalid S5 destination hostname");
   return new Uint8Array([3, domain.length, ...domain]);
 }
@@ -324,11 +334,17 @@ interface Env {
 }
 
 const DEFAULT_AP = [80, 443, 8080, 8443, 2053, 2083, 2087, 2096];
+const DEFAULT_AP_SET = new Set(DEFAULT_AP);
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+const WS_BACKPRESSURE_HIGH_WATER_BYTES = 1 * 1024 * 1024;
 const MAX_WS_BUFFERED_BYTES = 4 * 1024 * 1024;
+const WS_BACKPRESSURE_MAX_WAIT_MS = 10_000;
+const MAX_UPSTREAM_QUEUED_BYTES = 8 * 1024 * 1024;
 const MAX_CONNECTIONS_PER_ISOLATE = 50;
 const MAX_CONNECTION_LIFETIME_MS = 10 * 60 * 1000;
 const IDLE_CONNECTION_TIMEOUT_MS = 2 * 60 * 1000;
+const MIN_V1_HEADER_BYTES = 22;
+const WS_OPEN_READY_STATE = 1;
 let activeConnections = 0;
 
 // Diagnostics are disabled in production. Never log raw frame prefixes: the
@@ -363,10 +379,15 @@ function response(body: BodyInit | null, status: number, headers?: HeadersInit):
   return new Response(body, { status, headers: merged });
 }
 
-
-export async function toBytes(data: unknown): Promise<Uint8Array> {
+export function toBytesSync(data: unknown): Uint8Array | null {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  return null;
+}
+
+export async function toBytes(data: unknown): Promise<Uint8Array> {
+  const sync = toBytesSync(data);
+  if (sync) return sync;
   // Cloudflare Workers may deliver binary frames as Blob when
   // websocket_standard_binary_type is enabled by the compatibility date.
   if (typeof Blob !== "undefined" && data instanceof Blob) {
@@ -376,30 +397,82 @@ export async function toBytes(data: unknown): Promise<Uint8Array> {
 }
 
 /**
+ * Decodes optional VLESS WebSocket 0-RTT early data carried in the
+ * Sec-WebSocket-Protocol header (base64url). Returns null when absent,
+ * non-base64url, or shorter than a minimal V1 header.
+ */
+export function decodeEarlyDataHeader(header: string | null): Uint8Array | null {
+  if (!header) return null;
+  const trimmed = header.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.replace(/-/g, "+").replace(/_/g, "/");
+  if (!/^[A-Za-z0-9+/=]+$/.test(normalized)) return null;
+  const mod = normalized.length % 4;
+  if (mod === 1) return null;
+  const padded = mod === 0 ? normalized : normalized + "=".repeat(4 - mod);
+  try {
+    const binary = atob(padded);
+    if (binary.length < MIN_V1_HEADER_BYTES) return null;
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+let cachedAllowedHostsRaw: string | undefined;
+let cachedAllowedHostsSet: Set<string> | undefined;
+
+/**
  * An unset or empty AH disables only hostname allowlist matching.
  * A configured but malformed AH rejects the destination.
  */
 export function isDestinationHostAllowed(hostname: string, rawAllowedHosts: string | undefined): boolean {
   if (!rawAllowedHosts?.trim()) return true;
   try {
-    return isAllowedDestinationHost(hostname, parseAllowedHosts(rawAllowedHosts));
+    let allowed: Set<string>;
+    if (rawAllowedHosts === cachedAllowedHostsRaw && cachedAllowedHostsSet) {
+      allowed = cachedAllowedHostsSet;
+    } else {
+      allowed = parseAllowedHosts(rawAllowedHosts);
+      cachedAllowedHostsRaw = rawAllowedHosts;
+      cachedAllowedHostsSet = allowed;
+    }
+    return isAllowedDestinationHost(hostname, allowed);
   } catch {
     return false;
   }
 }
 
+let cachedAllowedPortsRaw: string | undefined;
+let cachedAllowedPortsSet: Set<number> | undefined;
+
 function allowedPorts(env: Env): Set<number> {
   const raw = env.AP?.trim();
-  if (!raw) return new Set(DEFAULT_AP);
+  if (!raw) return DEFAULT_AP_SET;
+  if (raw === cachedAllowedPortsRaw && cachedAllowedPortsSet) return cachedAllowedPortsSet;
   const ports = raw.split(",").map((value) => Number(value.trim()));
   if (ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535)) {
     throw new Error("AP contains an invalid port");
   }
-  return new Set(ports);
+  const set = new Set(ports);
+  cachedAllowedPortsRaw = raw;
+  cachedAllowedPortsSet = set;
+  return set;
 }
 
-class SocketReader {
-  private buffer = new Uint8Array(0);
+export type PumpBackpressureOptions = {
+  highWaterBytes?: number;
+  maxBufferedBytes?: number;
+  maxWaitMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+};
+
+const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+export class SocketReader {
+  private buffer: Uint8Array = new Uint8Array(0);
   private readonly reader: ReadableStreamDefaultReader<Uint8Array>;
 
   constructor(readable: ReadableStream<Uint8Array>) {
@@ -407,6 +480,16 @@ class SocketReader {
   }
 
   async readExactly(length: number): Promise<Uint8Array> {
+    if (this.buffer.length === 0) {
+      const { value, done } = await this.reader.read();
+      if (done || !value) throw new Error("SOCKS5 upstream closed during handshake");
+      if (value.length === length) return value;
+      if (value.length > length) {
+        this.buffer = value.subarray(length);
+        return value.subarray(0, length);
+      }
+      this.buffer = value;
+    }
     while (this.buffer.length < length) {
       const { value, done } = await this.reader.read();
       if (done || !value) throw new Error("SOCKS5 upstream closed during handshake");
@@ -415,14 +498,51 @@ class SocketReader {
       merged.set(value, this.buffer.length);
       this.buffer = merged;
     }
-    const result = this.buffer.slice(0, length);
-    this.buffer = this.buffer.slice(length);
+    const result = this.buffer.subarray(0, length);
+    this.buffer = this.buffer.subarray(length);
     return result;
   }
 
-  async pumpTo(websocket: WebSocket, isClosed: () => boolean, onActivity: () => void): Promise<void> {
+  async pumpTo(
+    websocket: Pick<WebSocket, "readyState" | "bufferedAmount" | "send" | "close">,
+    isClosed: () => boolean,
+    onActivity: () => void,
+    responseHeader?: Uint8Array,
+    options?: PumpBackpressureOptions,
+  ): Promise<void> {
+    const highWaterBytes = options?.highWaterBytes ?? WS_BACKPRESSURE_HIGH_WATER_BYTES;
+    const maxBufferedBytes = options?.maxBufferedBytes ?? MAX_WS_BUFFERED_BYTES;
+    const maxWaitMs = options?.maxWaitMs ?? WS_BACKPRESSURE_MAX_WAIT_MS;
+    const sleep = options?.sleep ?? defaultSleep;
+    let pendingHeader = responseHeader;
+
+    const waitForBackpressure = async (): Promise<boolean> => {
+      if (websocket.bufferedAmount < highWaterBytes) return true;
+      let waitedMs = 0;
+      let delayMs = 10;
+      while (!isClosed() && websocket.readyState === WS_OPEN_READY_STATE && websocket.bufferedAmount >= highWaterBytes) {
+        if (waitedMs >= maxWaitMs) {
+          if (websocket.bufferedAmount > maxBufferedBytes) {
+            try { websocket.close(1013, "client cannot keep up"); } catch { /* already closed */ }
+            return false;
+          }
+          return true;
+        }
+        const step = Math.min(delayMs, maxWaitMs - waitedMs);
+        await sleep(step);
+        waitedMs += step;
+        delayMs = Math.min(delayMs * 2, 50);
+      }
+      return !isClosed() && websocket.readyState === WS_OPEN_READY_STATE;
+    };
+
     try {
       while (!isClosed()) {
+        if (websocket.readyState !== WS_OPEN_READY_STATE) break;
+        if (websocket.bufferedAmount >= highWaterBytes) {
+          if (!(await waitForBackpressure())) break;
+        }
+
         let chunk: Uint8Array | undefined;
         if (this.buffer.length) {
           chunk = this.buffer;
@@ -434,12 +554,19 @@ class SocketReader {
         }
         if (chunk?.length) {
           onActivity();
-          if (websocket.readyState !== WebSocket.OPEN) break;
-          if (websocket.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
-            try { websocket.close(1013, "client cannot keep up"); } catch { /* already closed */ }
-            break;
+          if (websocket.readyState !== WS_OPEN_READY_STATE) break;
+          if (websocket.bufferedAmount > maxBufferedBytes) {
+            if (!(await waitForBackpressure())) break;
           }
-          websocket.send(chunk);
+          if (pendingHeader) {
+            const combined = new Uint8Array(pendingHeader.length + chunk.length);
+            combined.set(pendingHeader, 0);
+            combined.set(chunk, pendingHeader.length);
+            pendingHeader = undefined;
+            websocket.send(combined);
+          } else {
+            websocket.send(chunk);
+          }
         }
       }
     } finally {
@@ -463,12 +590,12 @@ async function connectViaSocks5(
   if ((username.length > 0) !== (password.length > 0)) {
     throw new Error("Both SU and SP must be set together");
   }
-  const usernameBytes = new TextEncoder().encode(username);
-  const passwordBytes = new TextEncoder().encode(password);
+  const usernameBytes = UTF8_ENCODER.encode(username);
+  const passwordBytes = UTF8_ENCODER.encode(password);
   if (usernameBytes.length > 255 || passwordBytes.length > 255) throw new Error("SOCKS5 credentials exceed protocol limits");
 
   const socket = connect({ hostname: env.H.trim(), port: proxyPort }, { allowHalfOpen: true });
-  await socket.opened;
+  void socket.opened.catch(() => { /* connection failure surfaces via reader/writer */ });
   const writer = socket.writable.getWriter();
   const reader = new SocketReader(socket.readable);
 
@@ -503,7 +630,7 @@ async function connectViaSocks5(
 
     return { socket, reader, writer };
   } catch (error) {
-    try { await writer.close(); } catch { /* already closed */ }
+    try { await writer.abort(); } catch { /* already closed */ }
     try { await socket.close(); } catch { /* already closed */ }
     throw error;
   }
@@ -516,20 +643,30 @@ type UpstreamConnection = {
   writer: WritableStreamDefaultWriter<Uint8Array>;
 };
 
-async function connectDirect(host: string, port: number): Promise<UpstreamConnection> {
+function connectDirect(host: string, port: number): UpstreamConnection {
   const socket = connect({ hostname: host, port }, { allowHalfOpen: true });
-  await socket.opened;
+  // Pipeline the initial payload immediately without waiting for an extra JS
+  // wakeup on socket.opened; dial errors surface cleanly via readable/writable.
+  void socket.opened.catch(() => { /* handled via stream errors */ });
   return { socket, writer: socket.writable.getWriter(), reader: new SocketReader(socket.readable) };
 }
 
+let cachedRelayRaw: string | undefined;
+let cachedRelayList: Array<{ hostname: string; port: number }> | undefined;
+
 function relayCandidates(env: Env): Array<{ hostname: string; port: number }> {
-  return (env.RE || "").split(/[;,\n]+/).map((item) => item.trim()).filter(Boolean).map((item) => {
+  const raw = env.RE || "";
+  if (raw === cachedRelayRaw && cachedRelayList) return cachedRelayList;
+  const list = raw.split(/[;,\n]+/).map((item) => item.trim()).filter(Boolean).map((item) => {
     const match = /^([^:\s]+):(\d{1,5})$/.exec(item);
     if (!match) throw new Error("RE entries must use host:port format");
     const port = Number(match[2]);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid relay port");
     return { hostname: match[1], port };
   });
+  cachedRelayRaw = raw;
+  cachedRelayList = list;
+  return list;
 }
 
 function stableIndex(value: string, count: number): number {
@@ -593,57 +730,52 @@ async function connectViaRelay(env: Env, destinationHost: string, destinationPor
     (lastError instanceof Error ? lastError.message : "upstream connection failed"));
 }
 
-async function connectOutbound(env: Env, host: string, port: number): Promise<UpstreamConnection> {
-  const mode = (env.OM || "direct").trim().toLowerCase();
-  if (mode === "direct") return connectDirect(host, port);
-  if (mode === "socks5") return connectViaSocks5(env, host, port);
-  if (mode === "relay") return connectViaRelay(env, host, port);
-  throw new Error("OM must be direct, relay, or socks5");
-}
-
 async function handleWebSocket(request: Request, env: Env): Promise<Response> {
-  const requestId = crypto.randomUUID();
+  const requestId = DEBUG_LOG ? crypto.randomUUID() : "";
   const startedAt = Date.now();
-  debugLog("WS_REQUEST", {
-    requestId,
-    method: request.method,
-    url: request.url,
-    upgrade: request.headers.get("Upgrade"),
-    protocol: request.headers.get("Sec-WebSocket-Protocol"),
-    proxyEnabled: env.PE === "true",
-    uuidConfigured: Boolean(env.UUID),
-    uuidFormatValid: Boolean(env.UUID && /^[0-9a-f]{8}-?[0-9a-f]{4}-?4?[0-9a-f]{3}-?[89ab]?[0-9a-f]{3}-?[0-9a-f]{12}$/i.test(env.UUID)),
-    outboundMode: (env.OM || "direct").trim().toLowerCase(),
-    allowedPorts: env.AP || "(default)",
-    allowedHostsConfigured: Boolean(env.AH?.trim()),
-    outboundConfigured: isOutboundConfigured(env),
-  });
+  const outboundMode = (env.OM || "direct").trim().toLowerCase();
+  if (DEBUG_LOG) {
+    debugLog("WS_REQUEST", {
+      requestId,
+      method: request.method,
+      url: request.url,
+      upgrade: request.headers.get("Upgrade"),
+      hasProtocolHeader: Boolean(request.headers.get("Sec-WebSocket-Protocol")),
+      proxyEnabled: env.PE === "true",
+      uuidConfigured: Boolean(env.UUID),
+      uuidFormatValid: Boolean(env.UUID && /^[0-9a-f]{8}-?[0-9a-f]{4}-?4?[0-9a-f]{3}-?[89ab]?[0-9a-f]{3}-?[0-9a-f]{12}$/i.test(env.UUID)),
+      outboundMode,
+      allowedPorts: env.AP || "(default)",
+      allowedHostsConfigured: Boolean(env.AH?.trim()),
+      outboundConfigured: isOutboundConfigured(env),
+    });
+  }
 
   if (request.method !== "GET") {
-    debugLog("WS_REJECT", { requestId, stage: "HTTP_METHOD", method: request.method });
+    if (DEBUG_LOG) debugLog("WS_REJECT", { requestId, stage: "HTTP_METHOD", method: request.method });
     return response("Not found", 404);
   }
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-    debugLog("WS_REJECT", { requestId, stage: "UPGRADE_HEADER" });
+    if (DEBUG_LOG) debugLog("WS_REJECT", { requestId, stage: "UPGRADE_HEADER" });
     return response("Not found", 404);
   }
   if (env.PE !== "true") {
-    debugLog("WS_REJECT", { requestId, stage: "PROXY_DISABLED" });
+    if (DEBUG_LOG) debugLog("WS_REJECT", { requestId, stage: "PROXY_DISABLED" });
     return response("Not found", 404);
   }
   if (!env.UUID || !isOutboundConfigured(env)) {
-    debugLog("WS_REJECT", { requestId, stage: "CONFIGURATION", uuidConfigured: Boolean(env.UUID), outboundConfigured: isOutboundConfigured(env) });
+    if (DEBUG_LOG) debugLog("WS_REJECT", { requestId, stage: "CONFIGURATION", uuidConfigured: Boolean(env.UUID), outboundConfigured: isOutboundConfigured(env) });
     return response("Not found", 404);
   }
   if (activeConnections >= MAX_CONNECTIONS_PER_ISOLATE) {
-    debugLog("WS_REJECT", { requestId, stage: "CONNECTION_LIMIT" });
+    if (DEBUG_LOG) debugLog("WS_REJECT", { requestId, stage: "CONNECTION_LIMIT" });
     return response("Service unavailable", 503, { "retry-after": "30" });
   }
 
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
-  // Keep the existing synchronous binary-frame path on Workers whose default is Blob.
+  // Keep the synchronous binary-frame path on Workers whose default is Blob.
   // toBytes also supports Blob defensively if the runtime type is changed later.
   server.binaryType = "arraybuffer";
   server.accept({ allowHalfOpen: true });
@@ -652,161 +784,283 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   let upstream: ReturnType<typeof connect> | undefined;
   let upstreamWriter: WritableStreamDefaultWriter<Uint8Array> | undefined;
   let initialized = false;
+  let connecting = false;
   let closed = false;
   let messageIndex = 0;
-  let messageChain = Promise.resolve();
+  let pendingDecodes = 0;
+  let decodeChain = Promise.resolve();
+  let inFlightWriteBytes = 0;
+  const pendingUpstream: Uint8Array[] = [];
+  let pendingUpstreamBytes = 0;
+  let lastActivityAt = startedAt;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let lifetimeTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const refreshIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => { void closeBoth(1001, "idle timeout"); }, IDLE_CONNECTION_TIMEOUT_MS);
+  const markActivity = () => {
+    lastActivityAt = Date.now();
+  };
+
+  const scheduleIdleCheck = (delayMs: number) => {
+    idleTimer = setTimeout(() => {
+      if (closed) return;
+      const remaining = IDLE_CONNECTION_TIMEOUT_MS - (Date.now() - lastActivityAt);
+      if (remaining > 0) {
+        scheduleIdleCheck(remaining);
+        return;
+      }
+      void closeBoth(1001, "idle timeout");
+    }, delayMs);
   };
 
   const closeBoth = async (code = 1000, reason = "connection closed") => {
     if (closed) return;
     closed = true;
+    pendingUpstream.length = 0;
+    pendingUpstreamBytes = 0;
     if (idleTimer) clearTimeout(idleTimer);
     if (lifetimeTimer) clearTimeout(lifetimeTimer);
     activeConnections = Math.max(0, activeConnections - 1);
-    debugLog("WS_CLOSE", {
-      requestId, code, reason, initialized,
-      lifetimeMs: Date.now() - startedAt,
-      messageCount: messageIndex,
-      upstreamConnected: Boolean(upstream),
-    });
-    try { server.close(code, reason.slice(0, 100)); } catch (error) { debugLog("WS_CLOSE_SERVER_ERROR", { requestId, ...debugError(error) }); }
-    try { await upstreamWriter?.close(); } catch (error) { debugLog("UPSTREAM_WRITER_CLOSE_ERROR", { requestId, ...debugError(error) }); }
-    try { await upstream?.close(); } catch (error) { debugLog("UPSTREAM_SOCKET_CLOSE_ERROR", { requestId, ...debugError(error) }); }
+    if (DEBUG_LOG) {
+      debugLog("WS_CLOSE", {
+        requestId, code, reason, initialized,
+        lifetimeMs: Date.now() - startedAt,
+        messageCount: messageIndex,
+        upstreamConnected: Boolean(upstream),
+      });
+    }
+    try { server.close(code, reason.slice(0, 100)); } catch (error) {
+      if (DEBUG_LOG) debugLog("WS_CLOSE_SERVER_ERROR", { requestId, ...debugError(error) });
+    }
+    if (upstreamWriter) {
+      try { await upstreamWriter.abort(); } catch (error) {
+        if (DEBUG_LOG) debugLog("UPSTREAM_WRITER_CLOSE_ERROR", { requestId, ...debugError(error) });
+        try { upstreamWriter.releaseLock(); } catch { /* already released */ }
+      }
+    }
+    try { await upstream?.close(); } catch (error) {
+      if (DEBUG_LOG) debugLog("UPSTREAM_SOCKET_CLOSE_ERROR", { requestId, ...debugError(error) });
+    }
   };
 
-  refreshIdleTimer();
-  lifetimeTimer = setTimeout(() => { void closeBoth(1001, "maximum lifetime reached"); }, MAX_CONNECTION_LIFETIME_MS);
+  const writeToUpstream = (chunk: Uint8Array) => {
+    if (closed || !upstreamWriter) return;
+    const len = chunk.byteLength;
+    if (len === 0) return;
+    inFlightWriteBytes += len;
+    if (inFlightWriteBytes > MAX_UPSTREAM_QUEUED_BYTES) {
+      void closeBoth(1013, "upstream cannot keep up");
+      return;
+    }
+    void upstreamWriter.write(chunk).then(
+      () => {
+        inFlightWriteBytes = Math.max(0, inFlightWriteBytes - len);
+      },
+      (error: unknown) => {
+        inFlightWriteBytes = Math.max(0, inFlightWriteBytes - len);
+        if (DEBUG_LOG) debugLog("UPSTREAM_WRITE_FAILED", { requestId, ...debugError(error) });
+        void closeBoth(1011, "upstream write failed");
+      },
+    );
+  };
 
-  debugLog("WS_ACCEPTED", { requestId, readyState: server.readyState });
+  const attachUpstream = (connection: UpstreamConnection, version: number, initialPayload: Uint8Array) => {
+    if (closed) {
+      void connection.writer.abort().catch(() => { /* already closed */ });
+      void connection.socket.close().catch(() => { /* already closed */ });
+      return;
+    }
+    upstream = connection.socket;
+    upstreamWriter = connection.writer;
+    initialized = true;
+    connecting = false;
 
-  server.addEventListener("message", (event: MessageEvent) => {
-    messageIndex += 1;
-    const currentMessage = messageIndex;
-    messageChain = messageChain.then(async () => {
-      if (closed) {
-        debugLog("MESSAGE_IGNORED_CLOSED", { requestId, messageIndex: currentMessage });
+    if (initialPayload.byteLength) {
+      writeToUpstream(initialPayload);
+    }
+    if (pendingUpstream.length) {
+      for (const queued of pendingUpstream) {
+        writeToUpstream(queued);
+      }
+      pendingUpstream.length = 0;
+      pendingUpstreamBytes = 0;
+    }
+
+    const responseHeader = new Uint8Array([version, 0]);
+    void connection.reader.pumpTo(server, () => closed, markActivity, responseHeader)
+      .then(
+        () => {
+          if (DEBUG_LOG) debugLog("UPSTREAM_READ_PUMP_ENDED", { requestId });
+          if (!closed) void closeBoth(1000, "upstream ended");
+        },
+        (error: unknown) => {
+          if (DEBUG_LOG) debugLog("UPSTREAM_READ_PUMP_ERROR", { requestId, ...debugError(error) });
+          void closeBoth(1011, "upstream read failed");
+        },
+      );
+  };
+
+  const handleDecodedFrame = (bytes: Uint8Array, currentMessage: number) => {
+    if (closed) return;
+    markActivity();
+
+    if (bytes.byteLength > MAX_MESSAGE_BYTES) {
+      if (DEBUG_LOG) debugLog("MESSAGE_SIZE_REJECTED", { requestId, messageIndex: currentMessage, byteLength: bytes.byteLength });
+      void closeBoth(1008, "connection rejected");
+      return;
+    }
+
+    if (initialized) {
+      writeToUpstream(bytes);
+      return;
+    }
+
+    if (connecting) {
+      pendingUpstreamBytes += bytes.byteLength;
+      if (pendingUpstreamBytes > MAX_UPSTREAM_QUEUED_BYTES) {
+        void closeBoth(1013, "upstream cannot keep up");
         return;
       }
-      refreshIdleTimer();
+      pendingUpstream.push(bytes);
+      return;
+    }
 
-      let stage = "MESSAGE_DECODE";
-      const messageStartedAt = Date.now();
-      try {
-        const dataType = event.data instanceof ArrayBuffer ? "ArrayBuffer"
-          : ArrayBuffer.isView(event.data) ? "ArrayBufferView"
-          : typeof Blob !== "undefined" && event.data instanceof Blob ? "Blob" : typeof event.data;
-        debugLog("MESSAGE_RECEIVED", {
-          requestId, messageIndex: currentMessage, dataType,
-          rawLength: typeof event.data === "string" ? event.data.length
-            : event.data && typeof event.data === "object" && "byteLength" in event.data
-              ? (event.data as { byteLength?: number }).byteLength
-              : typeof Blob !== "undefined" && event.data instanceof Blob ? event.data.size : undefined,
-          initialized,
-        });
-
-        const bytes = await toBytes(event.data);
-        debugLog("MESSAGE_DECODED", {
+    let stage = "VLESS_PARSE";
+    const messageStartedAt = DEBUG_LOG ? Date.now() : 0;
+    try {
+      const parsed = parseV1Request(bytes, env.UUID);
+      if (DEBUG_LOG) {
+        debugLog("VLESS_PARSE_SUCCESS", {
           requestId, messageIndex: currentMessage,
-          byteLength: bytes.byteLength,
-          // Do not log frame contents or prefixes; the first VLESS frame contains the UUID.
+          version: parsed.version, command: "TCP",
+          destination: parsed.hostname, port: parsed.port,
+          payloadLength: parsed.payload.byteLength,
+          uuidMatched: true,
         });
-        if (bytes.byteLength > MAX_MESSAGE_BYTES) {
-          stage = "MESSAGE_SIZE_CHECK";
-          throw new Error("WebSocket message exceeds 8 MiB limit");
-        }
+      }
 
-        if (!initialized) {
-          stage = "VLESS_PARSE";
-          debugLog("VLESS_PARSE_START", { requestId, messageIndex: currentMessage, messageLength: bytes.byteLength });
-          const parsed = parseV1Request(bytes, env.UUID);
-          debugLog("VLESS_PARSE_SUCCESS", {
-            requestId, messageIndex: currentMessage,
-            version: parsed.version, command: "TCP",
-            destination: parsed.hostname, port: parsed.port,
-            payloadLength: parsed.payload.byteLength,
-            uuidMatched: true,
-          });
+      stage = "PORT_CHECK";
+      const ports = allowedPorts(env);
+      if (!ports.has(parsed.port)) throw new Error("Destination port is not allowed");
 
-          stage = "PORT_CHECK";
-          const ports = allowedPorts(env);
-          debugLog("PORT_CHECK_START", { requestId, destinationPort: parsed.port, configuredPorts: Array.from(ports) });
-          if (!ports.has(parsed.port)) throw new Error("Destination port is not allowed");
-          debugLog("PORT_CHECK_SUCCESS", { requestId, destinationPort: parsed.port });
+      stage = "HOST_CHECK";
+      const destinationHost = normalizeParsedDestination(parsed.hostname);
+      if (!isDestinationHostAllowed(destinationHost, env.AH)) throw new Error("Destination host is not allowed");
 
-          stage = "HOST_CHECK";
-          const destinationHost = normalizeParsedDestination(parsed.hostname);
-          debugLog("HOST_CHECK_START", { requestId, destinationHost, allowlistConfigured: Boolean(env.AH?.trim()) });
-          if (!isDestinationHostAllowed(destinationHost, env.AH)) throw new Error("Destination host is not allowed");
-          debugLog("HOST_CHECK_SUCCESS", { requestId, destinationHost });
+      stage = "TCP_CONNECT";
+      const connectStartedAt = DEBUG_LOG ? Date.now() : 0;
+      if (DEBUG_LOG) {
+        debugLog("TCP_CONNECT_START", { requestId, mode: outboundMode, destinationHost, destinationPort: parsed.port });
+      }
 
-          stage = "TCP_CONNECT";
-          const connectStartedAt = Date.now();
-          const mode = (env.OM || "direct").trim().toLowerCase();
-          debugLog("TCP_CONNECT_START", { requestId, mode, destinationHost, destinationPort: parsed.port });
-          const connection = await connectOutbound(env, destinationHost, parsed.port);
-          debugLog("TCP_CONNECT_SUCCESS", {
-            requestId, mode, destinationHost, destinationPort: parsed.port,
-            connectDurationMs: Date.now() - connectStartedAt,
-          });
-
-          stage = "INITIALIZE_STATE";
-          upstream = connection.socket;
-          upstreamWriter = connection.writer;
-          initialized = true;
-          server.send(new Uint8Array([parsed.version, 0]));
-          debugLog("VLESS_RESPONSE_SENT", { requestId, responseHeaderHex: "00 00" });
-
-          if (parsed.payload.byteLength) {
-            stage = "UPSTREAM_INITIAL_WRITE";
-            debugLog("UPSTREAM_WRITE_START", { requestId, payloadLength: parsed.payload.byteLength });
-            await upstreamWriter.write(parsed.payload);
-            debugLog("UPSTREAM_WRITE_SUCCESS", { requestId, payloadLength: parsed.payload.byteLength });
-          }
-
-          void connection.reader.pumpTo(server, () => closed, refreshIdleTimer)
-            .then(() => debugLog("UPSTREAM_READ_PUMP_ENDED", { requestId }))
-            .finally(() => { if (!closed) void closeBoth(1000, "upstream ended"); })
-            .catch((error: unknown) => {
-              debugLog("UPSTREAM_READ_PUMP_ERROR", { requestId, ...debugError(error) });
-              return closeBoth(1011, "upstream read failed");
-            });
+      if (outboundMode === "direct") {
+        const connection = connectDirect(destinationHost, parsed.port);
+        attachUpstream(connection, parsed.version, parsed.payload);
+        if (DEBUG_LOG) {
           debugLog("INITIALIZATION_SUCCESS", { requestId, durationMs: Date.now() - messageStartedAt });
-          return;
         }
+        return;
+      }
 
-        stage = "UPSTREAM_WRITE";
-        if (!upstreamWriter) throw new Error("Upstream is not ready");
-        debugLog("UPSTREAM_WRITE_START", { requestId, messageIndex: currentMessage, byteLength: bytes.byteLength });
-        await upstreamWriter.write(bytes);
-        debugLog("UPSTREAM_WRITE_SUCCESS", { requestId, messageIndex: currentMessage, byteLength: bytes.byteLength });
-      } catch (error) {
+      if (outboundMode !== "socks5" && outboundMode !== "relay") {
+        throw new Error("OM must be direct, relay, or socks5");
+      }
+
+      connecting = true;
+      const connectPromise = outboundMode === "socks5"
+        ? connectViaSocks5(env, destinationHost, parsed.port)
+        : connectViaRelay(env, destinationHost, parsed.port);
+
+      void connectPromise.then(
+        (connection) => {
+          if (DEBUG_LOG) {
+            debugLog("TCP_CONNECT_SUCCESS", {
+              requestId, mode: outboundMode, destinationHost, destinationPort: parsed.port,
+              connectDurationMs: Date.now() - connectStartedAt,
+            });
+          }
+          attachUpstream(connection, parsed.version, parsed.payload);
+          if (DEBUG_LOG) {
+            debugLog("INITIALIZATION_SUCCESS", { requestId, durationMs: Date.now() - messageStartedAt });
+          }
+        },
+        (error: unknown) => {
+          connecting = false;
+          if (DEBUG_LOG) {
+            debugLog("MESSAGE_PROCESSING_FAILED", {
+              requestId, messageIndex: currentMessage, stage: "TCP_CONNECT",
+              durationMs: Date.now() - messageStartedAt,
+              ...debugError(error),
+            });
+          }
+          void closeBoth(1008, "connection rejected");
+        },
+      );
+    } catch (error) {
+      if (DEBUG_LOG) {
         debugLog("MESSAGE_PROCESSING_FAILED", {
           requestId, messageIndex: currentMessage, stage,
           durationMs: Date.now() - messageStartedAt,
           ...debugError(error),
         });
-        await closeBoth(1008, "connection rejected");
       }
-    }).catch(async (error: unknown) => {
-      debugLog("MESSAGE_CHAIN_UNHANDLED_ERROR", { requestId, messageIndex: currentMessage, ...debugError(error) });
-      await closeBoth(1011, "internal error");
+      void closeBoth(1008, "connection rejected");
+    }
+  };
+
+  scheduleIdleCheck(IDLE_CONNECTION_TIMEOUT_MS);
+  lifetimeTimer = setTimeout(() => { void closeBoth(1001, "maximum lifetime reached"); }, MAX_CONNECTION_LIFETIME_MS);
+
+  if (DEBUG_LOG) debugLog("WS_ACCEPTED", { requestId, readyState: server.readyState });
+
+  server.addEventListener("message", (event: MessageEvent) => {
+    if (closed) return;
+    messageIndex += 1;
+    const currentMessage = messageIndex;
+
+    if (pendingDecodes === 0) {
+      const syncBytes = toBytesSync(event.data);
+      if (syncBytes) {
+        handleDecodedFrame(syncBytes, currentMessage);
+        return;
+      }
+    }
+
+    pendingDecodes += 1;
+    decodeChain = decodeChain.then(async () => {
+      try {
+        if (closed) return;
+        const bytes = await toBytes(event.data);
+        handleDecodedFrame(bytes, currentMessage);
+      } catch (error) {
+        if (DEBUG_LOG) {
+          debugLog("MESSAGE_PROCESSING_FAILED", {
+            requestId, messageIndex: currentMessage, stage: "MESSAGE_DECODE",
+            ...debugError(error),
+          });
+        }
+        await closeBoth(1008, "connection rejected");
+      } finally {
+        pendingDecodes -= 1;
+      }
     });
   });
 
   server.addEventListener("close", (event: CloseEvent) => {
-    debugLog("WS_PEER_CLOSE", { requestId, code: event.code, reason: event.reason, wasClean: event.wasClean });
+    if (DEBUG_LOG) debugLog("WS_PEER_CLOSE", { requestId, code: event.code, reason: event.reason, wasClean: event.wasClean });
     void closeBoth(1000, "client closed");
   });
   server.addEventListener("error", (event: Event) => {
-    debugLog("WS_ERROR_EVENT", { requestId, eventType: event.type });
+    if (DEBUG_LOG) debugLog("WS_ERROR_EVENT", { requestId, eventType: event.type });
     void closeBoth(1011, "websocket error");
   });
+
+  // Start processing 0-RTT early data immediately so the outbound TCP dial and
+  // initial TLS ClientHello overlap with the 101 Switching Protocols response.
+  const earlyData = decodeEarlyDataHeader(request.headers.get("Sec-WebSocket-Protocol"));
+  if (earlyData) {
+    messageIndex += 1;
+    handleDecodedFrame(earlyData, messageIndex);
+  }
 
   return new Response(null, { status: 101, webSocket: client });
 }
