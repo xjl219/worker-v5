@@ -1,7 +1,22 @@
 name: Deploy worker-v5
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "wrangler.toml"
+      - "package.json"
+      - "scripts/**"
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-v5-production
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -9,22 +24,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
+
       - name: Install dependencies
-        run: npm install
+        run: npm install --no-audit --no-fund
+
       - name: Check types and tests
         run: npm run check
+
       - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      - name: Upload VLESS UUID secret
+        run: npm run deploy
         env:
-          WORKER_UUID: ${{ secrets.WORKER_UUID }}
-        run: |
-          test -n "$WORKER_UUID" || (echo "Missing GitHub secret WORKER_UUID" && exit 1)
-          printf '%s' "$WORKER_UUID" | npx wrangler secret put UUID
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
