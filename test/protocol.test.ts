@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseV1Request, encodeS5Address } from "../src/index";
+import { parseV1Request, encodeS5Address, normalizeParsedDestination } from "../src/index";
 import { isAllowedDestinationHost, isDestinationHostAllowed, normalizeDestinationHostname, parseAllowedHosts } from "../src/index";
 
 const UUID = "00000000-0000-4000-8000-000000000001";
@@ -19,6 +19,17 @@ describe("V1 request parser", () => {
     const result = parseV1Request(makeRequest("example.com"), UUID);
     expect(result.hostname).toBe("example.com");
     expect(result.port).toBe(443);
+  });
+
+  it("accepts a public IPv4 VLESS destination after decoding", () => {
+    const result = parseV1Request(makeRequest("8.8.8.8", 443, 1), UUID);
+    expect(normalizeParsedDestination(result.hostname)).toBe("8.8.8.8");
+  });
+
+  it("rejects a non-zero VLESS version", () => {
+    const data = makeRequest("example.com");
+    data[0] = 1;
+    expect(() => parseV1Request(data, UUID)).toThrow("Unsupported V1 version");
   });
 
   it("rejects an incorrect UUID", () => {
