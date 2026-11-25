@@ -137,7 +137,7 @@ Access adds a pre-Worker identity gate, but it is not a substitute for applicati
 #### Deployment sequence for the current workers.dev endpoint
 
 1. Run `npm ci`, `npm run check`, and `npx wrangler deploy --dry-run` locally or in CI.
-2. Verify the Cloudflare account and Worker name selected by Wrangler. This repository's config names the Worker `worker-v5-pluggable-v1`; do not deploy over a different production Worker by accident.
+2. Verify the Cloudflare account and Worker name selected by Wrangler. This repository's config names the Worker `worker-v5`; do not deploy over a different production Worker by accident.
 3. Run `npm run deploy`. The script provisions/reuses the UUID secret without printing it. Preserve `.wrangler/proxy-uuid.txt` securely if this is the first generated UUID; never commit or share it.
 4. In Cloudflare Dashboard, set `PE=false`; verify `HE=false`, the intended `OM`, and the relevant upstream variables/secrets. Confirm no Access application/policy has been created for this hostname and no WAF rules have been configured.
 5. Test the public hostname's BIC behavior with the actual VLESS client. An HTTP 1010 response is an edge rejection before Worker execution; it is not a VLESS UUID or Worker routing error.
